@@ -17,6 +17,10 @@ public class Win {
 "@
 Add-Type -AssemblyName System.Drawing
 
+# PrintWindow writes physical pixels. Without DPI awareness GetWindowRect reports
+# logical ones, so the bitmap is too small and the capture comes out cropped.
+try { Add-Type -MemberDefinition '[DllImport("shcore.dll")] public static extern int SetProcessDpiAwareness(int v);' -Name Dpi -Namespace W | Out-Null; [W.Dpi]::SetProcessDpiAwareness(2) | Out-Null } catch {}
+
 # All Sandbox* process ids (editor + engine)
 $pids = @{}
 Get-Process -ErrorAction SilentlyContinue | Where-Object { $_.ProcessName -like 'Sandbox*' } | ForEach-Object { $pids[[uint32]$_.Id] = $true }

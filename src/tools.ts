@@ -13,7 +13,7 @@
  */
 
 import { readFile } from "node:fs/promises";
-import { existsSync, readdirSync, statSync, openSync, readSync, closeSync } from "node:fs";
+import { existsSync, readdirSync, statSync, openSync, readSync, closeSync, readFileSync } from "node:fs";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { dirname, join } from "node:path";
@@ -468,6 +468,144 @@ export function registerTools(server: McpServer, client: StudioRpcClient) {
     },
   );
 
+  server.registerTool(
+    "overdare_mesh_bulk_import",
+    {
+      description:
+        "Get many prepared meshes into Studio in ONE trip through the UI. Packs up to 200 _overdare.fbx files into a single bundle, drives Bulk Import once, then reads the new asset ids back out of UGCLocalAssetTable.json and pairs each mesh with its texture. Returns [{asset, meshId, textureId}] ready for overdare_create_instances. Importing one file at a time costs a dialog per asset and each one is a chance for Studio to be busy or for another window to steal focus. STOP any playtest first.",
+      inputSchema: {
+        files: z
+          .array(z.string())
+          .min(1)
+          .max(200)
+          .describe("Absolute paths to prepared *_overdare.fbx files (max 200 — the Bulk Import limit)."),
+        bundleName: z
+          .string()
+          .optional()
+          .describe("Name for the bundle file; becomes the asset name prefix. Default: bundle_<timestamp>."),
+        outDir: z.string().optional().describe("Where to write the bundle (default: folder of the first input)."),
+        waitSec: z
+          .number()
+          .int()
+          .default(300)
+          .describe("How long to wait for Studio to cook and register the assets."),
+      },
+    },
+    async (a: Json) => {
+      try {
+        const files = (a.files as string[]).map((f) => f.trim()).filter(Boolean);
+        const missing = files.filter((f) => !existsSync(f));
+        if (missing.length) return errOut(`Not found: ${missing.slice(0, 5).join(", ")}`);
+
+        const projectDir = dirname(await getProjectFile());
+        const tablePath = join(projectDir, "UGCLocalAssetTable.json");
+        if (!existsSync(tablePath))
+          return errOut(`No UGCLocalAssetTable.json in ${projectDir} — is that the open project?`);
+
+        /** Registered assets, newest-id first. The table is how Studio records what it uploaded. */
+        const readTable = (): Array<{ id: number; name: string; type: string }> => {
+          const buf = readFileSync(tablePath);
+          const enc = buf.length > 1 && buf[0] === 0xff && buf[1] === 0xfe ? "utf16le" : "utf8";
+          const doc = JSON.parse(buf.toString(enc).replace(/^﻿/, "")) as {
+            localAssetList?: Record<string, { name?: string; worldAssetType?: string }>;
+          };
+          return Object.entries(doc.localAssetList ?? {}).map(([id, v]) => ({
+            id: Number(id),
+            name: String(v?.name ?? ""),
+            type: String(v?.worldAssetType ?? ""),
+          }));
+        };
+        const beforeMaxId = Math.max(0, ...readTable().map((r) => r.id));
+
+        // 1) bundle
+        const blender = findBlender();
+        const bundleScript = fileURLToPath(new URL("../scripts/bundle_meshes.py", import.meta.url));
+        if (!existsSync(bundleScript)) return errOut(`bundle_meshes.py not found at ${bundleScript}`);
+        const bundleName =
+          (a.bundleName as string) || `bundle_${new Date().toISOString().replace(/[^0-9]/g, "").slice(0, 14)}`;
+        const outDir = (a.outDir as string) || dirname(files[0]);
+        const bundlePath = join(outDir, `${bundleName}.fbx`);
+
+        const br = await execFileP(
+          blender,
+          ["--background", "--python", bundleScript, "--", bundlePath, ...files],
+          { timeout: 900000, maxBuffer: 64 * 1024 * 1024 },
+        ).catch((e: { stdout?: string }) => ({ stdout: e.stdout ?? "" }));
+        const bLine = (br.stdout || "").split(/\r?\n/).find((l) => l.startsWith("BUNDLE_JSON "));
+        if (!bLine) return errOut("Bundling failed — no BUNDLE_JSON from Blender.");
+        const bundle = JSON.parse(bLine.slice("BUNDLE_JSON ".length)) as {
+          ok: boolean; error?: string; assets: Array<{ meshObject: string; images: string[] }>;
+          duplicateNames?: string[]; meshObjects?: number; totalTris?: number; fileSizeMB?: number;
+        };
+        if (!bundle.ok) return errOut(`Bundling failed: ${bundle.error}`);
+        if (bundle.duplicateNames?.length)
+          return errOut(
+            `Duplicate mesh names ${bundle.duplicateNames.join(", ")} — they would collide into one asset and the texture pairing would attach the wrong image. Rename the inputs.`,
+          );
+
+        // 2) one trip through Bulk Import
+        const importer = fileURLToPath(new URL("../scripts/gui_import.ps1", import.meta.url));
+        const ir = await execFileP(
+          "powershell",
+          ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", importer, "-Files", bundlePath, "-Bulk"],
+          { timeout: 600000, maxBuffer: 16 * 1024 * 1024 },
+        ).catch((e: { stdout?: string }) => ({ stdout: e.stdout ?? "" }));
+        const importOut = ir.stdout || "";
+        if (!/STATUS=IMPORTED/.test(importOut))
+          return errOut(`Bulk Import did not complete:\n${importOut.trim().slice(-800)}`);
+
+        // 3) wait for registration — cooking and uploading each mesh takes far longer
+        //    than the dialog does to close, and the table only gains the ids at the end.
+        const deadline = Date.now() + ((a.waitSec as number) ?? 300) * 1000;
+        let fresh: Array<{ id: number; name: string; type: string }> = [];
+        for (;;) {
+          fresh = readTable().filter((r) => r.id > beforeMaxId);
+          if (fresh.filter((r) => r.type === "STATIC_MESH").length >= bundle.assets.length) break;
+          if (Date.now() > deadline) break;
+          await new Promise((r) => setTimeout(r, 5000));
+        }
+
+        // 4) pair by name. Studio names the mesh "<bundle>_<meshObject>" and each
+        //    texture "00_<image datablock>", and records no link between the two.
+        const byName = (n: string) => fresh.find((r) => r.name === n);
+        const results = bundle.assets.map((asset) => {
+          const mesh = byName(`${bundleName}_${asset.meshObject}`);
+          const tex = asset.images.map((i) => byName(`00_${i}`)).find(Boolean);
+          return {
+            asset: asset.meshObject,
+            meshId: mesh ? `ovdrassetid://${mesh.id}` : null,
+            textureId: tex ? `ovdrassetid://${tex.id}` : null,
+          };
+        });
+        const incomplete = results.filter((r) => !r.meshId);
+
+        return ok(
+          JSON.stringify(
+            {
+              bundle: bundlePath,
+              meshes: bundle.meshObjects,
+              totalTris: bundle.totalTris,
+              fileSizeMB: bundle.fileSizeMB,
+              registered: fresh.length,
+              results,
+              ...(incomplete.length
+                ? {
+                    warning: `${incomplete.length} asset(s) have no id yet — Studio may still be uploading. Re-read UGCLocalAssetTable.json in ${projectDir} shortly.`,
+                  }
+                : {}),
+              nextStep:
+                "Place them with overdare_create_instances (meshId + raw.TextureId), then overdare_save.",
+            },
+            null,
+            2,
+          ),
+        );
+      } catch (err) {
+        return fail(err);
+      }
+    },
+  );
+
   // ======================================================================
   //  EDIT-TIME ENGINE  (.ovdrjm direct edit + level.apply)
   //  Creates persistent instances the RPC can't (instance.upsert is absent).
@@ -489,26 +627,104 @@ export function registerTools(server: McpServer, client: StudioRpcClient) {
     return null;
   }
 
+  /** Project directories to consider: everything holding a .ovdrjm near the user. */
+  function candidateProjectDirs(): string[] {
+    const dirs = new Set<string>();
+    const add = (d: string | null | undefined) => {
+      if (d && existsSync(d)) dirs.add(d);
+    };
+    add(projectOverrideDir);
+    add(discoverProjectDirFromLog());
+    add(process.env.OVERDARE_PROJECT_DIR);
+    const home = process.env.USERPROFILE;
+    for (const base of home ? [join(home, "Desktop"), join(home, "Documents")] : []) {
+      try {
+        for (const name of readdirSync(base)) {
+          const d = join(base, name);
+          try {
+            if (statSync(d).isDirectory() && readdirSync(d).some((f) => f.toLowerCase().endsWith(".ovdrjm"))) {
+              dirs.add(d);
+            }
+          } catch {
+            /* unreadable entry */
+          }
+        }
+      } catch {
+        /* no such base dir */
+      }
+    }
+    return [...dirs];
+  }
+
+  /**
+   * Identify the open project by matching the live tree's GUIDs against the files
+   * on disk. Studio's log only names a project when it saves, so it can point at
+   * one the user closed long ago — and editing the wrong project is silent damage.
+   */
+  async function discoverProjectDirByGuid(): Promise<string | null> {
+    let guids: string[] = [];
+    try {
+      const res = (await client.call("level.browse", { depth: 0 })) as {
+        level?: Array<{ guid?: string }>;
+      };
+      guids = (res?.level ?? [])
+        .map((n) => n?.guid)
+        .filter((g): g is string => typeof g === "string" && g.length > 8)
+        .slice(0, 5);
+    } catch {
+      return null;
+    }
+    if (guids.length < 2) return null;
+    // A project saved under a new name keeps the GUIDs of the one it came from, so
+    // several files can match the same live tree. Returning the first is a coin
+    // flip that silently edits the wrong project — only a unique match is an answer.
+    const hits: string[] = [];
+    for (const dir of candidateProjectDirs()) {
+      try {
+        const buf = readFileSync(findProjectFile(dir));
+        const enc = buf.length > 1 && buf[0] === 0xff && buf[1] === 0xfe ? "utf16le" : "utf8";
+        const txt = buf.toString(enc);
+        if (guids.every((g) => txt.includes(g))) hits.push(dir);
+      } catch {
+        /* unreadable or no project file here */
+      }
+    }
+    return hits.length === 1 ? hits[0] : null;
+  }
+
   async function getProjectFile(): Promise<string> {
     if (projectFile) return projectFile;
     // 1) explicit override (overdare_set_project)
     if (projectOverrideDir) return (projectFile = findProjectFile(projectOverrideDir));
-    // 2) Studio's own log names the loaded project — cheap, side-effect free
-    const fromLog = discoverProjectDirFromLog();
-    if (fromLog) {
-      try {
-        return (projectFile = findProjectFile(fromLog));
-      } catch {
-        /* no .ovdrjm there — keep looking */
-      }
-    }
-    // 3) screenshot path (heavier; can time out while Studio is busy)
+    // 2) ask Studio where it puts screenshots. This is the only signal that comes
+    //    from the running editor itself, so it cannot name a project that is not
+    //    the open one — worth the extra round trip, because every other method
+    //    guesses, and a wrong guess edits somebody else's project in silence.
     const live = await discoverLoadedProjectDir();
     if (live) {
       try {
         return (projectFile = findProjectFile(live));
       } catch {
         /* keep looking */
+      }
+    }
+    // 3) match the live tree's GUIDs against the projects on disk (unique match only)
+    const byGuid = await discoverProjectDirByGuid();
+    if (byGuid) {
+      try {
+        return (projectFile = findProjectFile(byGuid));
+      } catch {
+        /* keep looking */
+      }
+    }
+    // 4) Studio's own log names the loaded project — cheap, but only rewritten on
+    //    save, so it can confidently name one the user closed long ago
+    const fromLog = discoverProjectDirFromLog();
+    if (fromLog) {
+      try {
+        return (projectFile = findProjectFile(fromLog));
+      } catch {
+        /* no .ovdrjm there — keep looking */
       }
     }
     // 4) env fallback
@@ -654,23 +870,39 @@ export function registerTools(server: McpServer, client: StudioRpcClient) {
     "overdare_update_instance",
     {
       description:
-        "Modify an existing instance's properties (and/or rename it) by GUID — edits the .ovdrjm and reloads. STOP any playtest first. Use after import/create to tweak material, color, size, transparency, etc. `props` is the same shape as overdare_create_instance.",
+        "Modify existing instances' properties (and/or rename) — edits the .ovdrjm and reloads. STOP any playtest first. Use after import/create to tweak material, color, size, transparency, etc. `props` is the same shape as overdare_create_instance. Pass `guids` instead of `guid` to apply the same props to many instances in ONE reload — far faster than one call per instance when restyling a whole set (e.g. recolouring every wall segment).",
       inputSchema: {
-        guid: z.string().describe("ActorGuid to update (from overdare_browse)."),
+        guid: z.string().optional().describe("ActorGuid to update (from overdare_browse)."),
+        // Some clients hand arrays over as a JSON string, so accept either form.
+        guids: z
+          .union([z.array(z.string()), z.string()])
+          .optional()
+          .describe("ActorGuids to update with the same props, in a single edit (max 500)."),
         props: PROPS_SHAPE.optional(),
-        name: z.string().optional().describe("New name (optional)."),
+        name: z.string().optional().describe("New name (optional; only with a single `guid`)."),
       },
     },
     async (a: Json) => {
       try {
+        const raw = a.guids;
+        const list: string[] =
+          typeof raw === "string"
+            ? (JSON.parse(raw) as string[])
+            : ((raw as string[] | undefined) ?? (a.guid ? [a.guid as string] : []));
+        if (list.length === 0) throw new Error("Provide `guid` or `guids`.");
+        if (list.length > 500) throw new Error("At most 500 guids per call.");
+        if (list.length > 1 && a.name) throw new Error("`name` only applies to a single `guid`.");
         const out = await applyEdit((doc) => {
-          const node = updateInstance(
-            doc,
-            a.guid as string,
-            (a.props as CreateProps) ?? {},
-            a.name as string | undefined,
-          );
-          return { guid: node.ActorGuid, name: node.Name };
+          const done = list.map((g) => {
+            const node = updateInstance(
+              doc,
+              g,
+              (a.props as CreateProps) ?? {},
+              a.name as string | undefined,
+            );
+            return { guid: node.ActorGuid, name: node.Name };
+          });
+          return done.length === 1 ? done[0] : { updated: done.length, items: done };
         });
         return ok(out.result);
       } catch (err) {
@@ -722,7 +954,14 @@ export function registerTools(server: McpServer, client: StudioRpcClient) {
           )
           .min(1)
           .max(50)
+          .optional()
           .describe("Instances to create."),
+        itemsFile: z
+          .string()
+          .optional()
+          .describe(
+            "Path to a JSON file holding the same array as `items` (max 200). Use this when a generator script produced the layout — it avoids pasting a large array through the tool call.",
+          ),
       },
     },
     async (a: Json) => {
@@ -730,11 +969,17 @@ export function registerTools(server: McpServer, client: StudioRpcClient) {
         const out = await applyEdit((doc) => {
           const parent = resolveNode(doc, (a.parent as string) ?? "Workspace");
           if (!parent) throw new Error(`Parent not found: ${a.parent}`);
-          const nodes = createInstances(
-            doc,
-            parent,
-            a.items as Array<{ className: string; name: string; props?: CreateProps }>,
-          );
+          type NewItem = { className: string; name: string; props?: CreateProps };
+          let list = a.items as NewItem[] | undefined;
+          if (a.itemsFile) {
+            const txt = readFileSync(a.itemsFile as string, "utf8");
+            list = JSON.parse(txt) as NewItem[];
+          }
+          if (!Array.isArray(list) || list.length === 0) {
+            throw new Error("Provide `items` or `itemsFile`.");
+          }
+          if (list.length > 200) throw new Error("At most 200 items per call.");
+          const nodes = createInstances(doc, parent, list);
           return nodes.map((n) => ({ guid: n.ActorGuid, name: n.Name }));
         });
         return ok(out.result);

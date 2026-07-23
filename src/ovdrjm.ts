@@ -33,13 +33,27 @@ export interface OvDoc {
   Root: OvNode;
 }
 
+/**
+ * Studio writes the project as UTF-16 LE with a BOM most of the time, but some
+ * saves come back as plain UTF-8. Decoding with the wrong one yields mojibake and
+ * a baffling "Unexpected token" from JSON.parse, so sniff the BOM and remember
+ * what each file used — a rewrite must not silently flip the encoding either.
+ */
+type Enc = "utf16le" | "utf8";
+const fileEncoding = new Map<string, Enc>();
+
 export function loadDoc(file: string): OvDoc {
-  const raw = readFileSync(file, "utf16le").replace(/^﻿/, "");
+  const buf = readFileSync(file);
+  const enc: Enc = buf.length > 1 && buf[0] === 0xff && buf[1] === 0xfe ? "utf16le" : "utf8";
+  fileEncoding.set(file, enc);
+  const raw = buf.toString(enc).replace(/^﻿/, "");
   return JSON.parse(raw) as OvDoc;
 }
 
 export function saveDoc(file: string, doc: OvDoc): void {
-  writeFileSync(file, BOM + JSON.stringify(doc, null, "\t"), "utf16le");
+  const enc = fileEncoding.get(file) ?? "utf16le";
+  const text = JSON.stringify(doc, null, "\t");
+  writeFileSync(file, enc === "utf16le" ? BOM + text : text, enc);
 }
 
 /** Find the single .ovdrjm in a project directory. */
