@@ -31,18 +31,24 @@ const layout = JSON.parse(readFileSync(layoutPath, "utf8"));        // gen17 ite
 const buf = readFileSync(`${projDir}/UGCLocalAssetTable.json`);
 const enc = buf.length > 1 && buf[0] === 0xff && buf[1] === 0xfe ? "utf16le" : "utf8";
 const L = JSON.parse(buf.toString(enc).replace(/^﻿/, "")).localAssetList;
-const idByName = {};
-const idBySuffix = {};   // "_<objName>" (bundle-index-stripped) -> newest id, for fallback
+// Importing one bundle registers SEVERAL assets under the same name — a STATIC_MESH
+// and a MODEL wrapper at least — and the MODEL usually gets the higher id. Indexing by
+// name alone and keeping the newest therefore hands a MeshPart a MODEL id, which it
+// cannot render: that is why whole landmarks went invisible while their bbox looked
+// right. Keep one index per asset type and resolve meshes and textures from their own.
+const meshIdByName = {};
+const texIdByName = {};
+const idBySuffix = {};   // objName with the "rb_NN_" prefix stripped -> newest mesh id
 for (const [id, v] of Object.entries(L)) {
-  if (String(v.worldAssetType) !== "STATIC_MESH" && String(v.worldAssetType) !== "TEXTURE") {
-    // still index all, textures included, but only meshes feed the suffix map below
-  }
   // OVERDARE rewrites '.' to '_' in object names on import (cv.002 -> cv_002), and a
   // name can repeat across import sessions, so index by the normalised name and keep
   // the newest id.
   const n = String(v.name).replace(/\./g, "_");
-  if (!idByName[n] || Number(id) > idByName[n]) idByName[n] = Number(id);
-  if (String(v.worldAssetType) === "STATIC_MESH") {
+  const type = String(v.worldAssetType);
+  if (type === "TEXTURE") {
+    if (!texIdByName[n] || Number(id) > texIdByName[n]) texIdByName[n] = Number(id);
+  } else if (type === "STATIC_MESH") {
+    if (!meshIdByName[n] || Number(id) > meshIdByName[n]) meshIdByName[n] = Number(id);
     // The bundle a given object actually landed in can differ from the planned
     // rebuild_bundles.json (imports weren't done in plan order). Object names are
     // globally unique across bundles, so strip the "rb_NN" prefix and index by the
@@ -157,13 +163,13 @@ for (const inst of layout) {
     const bi = objToBundle[o.objName];
     const meshName = bundleSize[bi] === 1 ? `rb_${bi}` : norm(`rb_${bi}_${o.objName}`);
     // exact bundle match first, then bundle-agnostic suffix fallback
-    const meshId = idByName[meshName] || idBySuffix[norm(o.objName)];
+    const meshId = meshIdByName[meshName] || idBySuffix[norm(o.objName)];
     if (!meshId) { missing.add(meshName); continue; }
     // Blender appends a duplicate suffix (".005") to an image datablock reused across
     // objects, but the texture registers under the base image name — so try the raw
     // name, then the name with that suffix dropped, before giving up.
     const texId = o.image
-      ? idByName[o.image] ?? idByName[texBase(o.image)] ?? idByName[norm(texBase(o.image))] ?? null
+      ? texIdByName[o.image] ?? texIdByName[texBase(o.image)] ?? texIdByName[norm(texBase(o.image))] ?? null
       : null;
 
     // object center (Blender m, Z-up) -> OVERDARE cm (x, z, y), scaled, yaw-rotated in XZ
