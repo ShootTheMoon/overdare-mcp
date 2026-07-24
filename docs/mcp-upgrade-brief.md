@@ -97,6 +97,20 @@ CDO 경로로 호출해도 라이브 뷰포트에 적용된다. **좌표계 주�
 **주의**: 0-인자 함수는 raw curl로 `"parameters":{}`를 보내면 `Unable to deserialize request`가
 난다. MCP의 RC 클라이언트 경로로는 정상 동작한다.
 
+### 콘솔 명령 — 가장 넓은 레버
+
+`/Script/Engine.Default__KismetSystemLibrary` 가 함수 **279개**와 함께 열려 있고, 그중
+`ExecuteConsoleCommand(WorldContextObject, Command)` 가 **실제로 먹는다**
+(`r.ScreenPercentage` 를 100→77→100 으로 왕복시켜 `GetConsoleVariableFloatValue` 로 확인).
+World 컨텍스트는 `MUnrealEditorSubsystem.GetEditorWorld` 가 주는 `/User/<프로젝트>.<프로젝트>`.
+
+이걸로 `r.*` 렌더 설정, `show` 플래그, `stat`, `HighResShot` 전체가 열린다.
+cvar 읽기는 `GetConsoleVariable{Float,Int,Bool,String}Value`. `overdare_console` 툴이 감싼다.
+명령이 그대로 실행되므로 `quit` 같은 건 세션을 끊는다 — 전용 툴이 있으면 그쪽을 쓸 것.
+
+찾다가 **안 된 것**: Lua 실행 경로(`LuaSubsystem` 계열은 CDO가 안 잡힘),
+`MEditorCommandAPISubsystem`(실질 함수 없음), `MSandboxSubsystem`/`MToolMenuSubsystem`(미해결).
+
 라이브 액터 경로는 `/User/<프로젝트>.<프로젝트>:PersistentLevel.LuaMeshPart_N` 형태이고
 **DataModel의 ActorGuid와 이름이 매칭되지 않는다** — 엔진 액터와 Luau 인스턴스를 잇는 값싼
 방법은 아직 없다. 그래서 선택 툴은 UE 경로를 받는다.

@@ -1117,6 +1117,54 @@ export function registerTools(server: McpServer, client: StudioRpcClient) {
   );
 
   server.registerTool(
+    "overdare_console",
+    {
+      description:
+        "Run an Unreal console command in Studio, or read a console variable. This is the widest lever the server has — the whole `r.*`, `show`, `stat` and `HighResShot` surface — so it is also the sharpest: commands are executed verbatim and some (quit, level travel) will disrupt the session. Prefer a dedicated tool when one exists.\n" +
+        "Examples: `r.ScreenPercentage 150` then a screenshot for a crisper shot; `stat fps` for an FPS overlay; `HighResShot 2` for a high-resolution capture.",
+      inputSchema: {
+        command: z.string().optional().describe('Console command, e.g. "r.ScreenPercentage 150".'),
+        cvar: z.string().optional().describe("Console variable to read back, e.g. \"r.ScreenPercentage\"."),
+      },
+    },
+    async (a: Json) => {
+      const KISMET = "/Script/Engine.Default__KismetSystemLibrary";
+      try {
+        if (!a.command && !a.cvar) throw new Error("Provide `command` and/or `cvar`.");
+        const world = retOf(await rc.call(UNREAL_ED, "GetEditorWorld", {})) as string;
+        if (a.command) {
+          await rc.call(KISMET, "ExecuteConsoleCommand", {
+            WorldContextObject: world,
+            Command: a.command as string,
+          });
+        }
+        // A cvar has one real type; read every getter and let the caller pick, rather
+        // than guessing wrong and reporting 0 for a string.
+        let value: Json | undefined;
+        if (a.cvar) {
+          const name = a.cvar as string;
+          const read = async (fn: string) => {
+            try {
+              return retOf(await rc.call(KISMET, fn, { VariableName: name }));
+            } catch {
+              return undefined;
+            }
+          };
+          value = {
+            float: await read("GetConsoleVariableFloatValue"),
+            int: await read("GetConsoleVariableIntValue"),
+            bool: await read("GetConsoleVariableBoolValue"),
+            string: await read("GetConsoleVariableStringValue"),
+          };
+        }
+        return ok({ executed: (a.command as string) ?? null, cvar: (a.cvar as string) ?? null, value });
+      } catch (err) {
+        return fail(err);
+      }
+    },
+  );
+
+  server.registerTool(
     "overdare_engine_assets",
     {
       description:
