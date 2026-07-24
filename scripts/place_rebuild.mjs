@@ -58,8 +58,10 @@ const texBase = (s) => s.replace(/\.\d+$/, "");   // drop Blender's ".005" dupli
 // Build object → {meshName, sourceAsset, sourceFile-less}. genbundles recorded per bundle.
 const objToBundle = {};   // objectName -> bundleIndex
 const objToAsset = {};    // objectName -> assetName (e.g. HQ_Trabant_overdare)
+const bundleSize = {};    // bundleIndex -> how many mesh objects it held
 for (const b of bundles) {
   const idx = String(b.i).padStart(2, "0");
+  bundleSize[idx] = (b.sources || []).reduce((n, s) => n + (s.objects || []).length, 0);
   for (const src of b.sources || []) {
     for (const o of src.objects || []) {
       objToBundle[o.object] = idx;
@@ -150,7 +152,10 @@ for (const inst of layout) {
   const suffix = inst.name.match(/_\d+$/)?.[0] || "";
 
   for (const o of objs) {
-    const meshName = norm(`rb_${objToBundle[o.objName]}_${o.objName}`);
+    // Bulk Import names a bundle's asset after the OBJECT only when the file held
+    // several meshes; a single-mesh file registers under the bundle name alone.
+    const bi = objToBundle[o.objName];
+    const meshName = bundleSize[bi] === 1 ? `rb_${bi}` : norm(`rb_${bi}_${o.objName}`);
     // exact bundle match first, then bundle-agnostic suffix fallback
     const meshId = idByName[meshName] || idBySuffix[norm(o.objName)];
     if (!meshId) { missing.add(meshName); continue; }
