@@ -64,6 +64,22 @@ hub.token.read                   action_sequencer_service.apply_json
 주의: `instance.upsert` / `instance.read` / `instance.move` / `script.read` / `script.edit` /
 `script.grep` / `project.json` 은 **없다.** 기존 코드가 .ovdrjm을 직접 편집하는 이유가 이것이다.
 
+**카메라는 RPC에 없다 — Remote Control로 간다.** 바이너리에서 RPC 메서드 문자열을 전수 추출한
+결과 총 34개이며 카메라/뷰포트 계열은 하나도 없다. 그리고 `Workspace.Camera`의 CFrame을
+.ovdrjm에서 고쳐도 **에디터 뷰포트는 움직이지 않는다** (파일에는 쓰이지만 `level.apply`가
+뷰포트 카메라를 다시 읽지 않는다 — 실측 확인). 실제로 동작하는 유일한 경로:
+
+```
+PUT /remote/object/call
+objectPath   /Script/UnrealEd.Default__MUnrealEditorSubsystem   ← 실제 클래스는 /Script/SandboxPlugin
+functionName SetLevelViewportCameraInfo | GetLevelViewportCameraInfo
+parameters   { CameraLocation: {X,Y,Z}, CameraRotation: {Pitch,Yaw,Roll} }
+```
+
+CDO 경로로 호출해도 라이브 뷰포트에 적용된다. **좌표계 주의**: 이 함수는 UE 네이티브
+(Z-up)라서 `UE(x, y, z) = OVERDARE(X, Z, Y)`로 축을 바꿔야 한다. UE yaw는 +X에서 +Y로 잰다.
+`overdare_camera` 툴이 이 변환과 look-at/포커스 계산을 감싸고 있다.
+
 **식별자**: 인스턴스는 `ActorGuid` (32자 hex). 세션이 바뀌어도 유지됨.
 
 **저장 형식**: `<프로젝트>\<이름>.ovdrjm` = JSON 트리.

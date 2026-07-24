@@ -101,6 +101,7 @@ import {
   loadDoc,
   saveDoc,
   resolveNode,
+  subtreeBounds,
   createInstance,
   createInstances,
   updateInstance,
@@ -905,6 +906,114 @@ export function registerTools(server: McpServer, client: StudioRpcClient) {
           return done.length === 1 ? done[0] : { updated: done.length, items: done };
         });
         return ok(out.result);
+      } catch (err) {
+        return fail(err);
+      }
+    },
+  );
+
+  server.registerTool(
+    "overdare_camera",
+    {
+      description:
+        "Aim the editor viewport camera, so the next overdare_screenshot shows what you want. Editing Workspace.Camera does NOT move the viewport — this drives it for real, via the Studio's MUnrealEditorSubsystem over Remote Control.\n" +
+        "Four ways to use it: `focus` frames an instance or a whole Folder/Model (it measures the subtree's bounds and backs off to fit); `position` + `lookAt` points at a world point; `position` + `orientation` sets the angle by hand; no arguments at all just reads back where the camera is.\n" +
+        "All coordinates are OVERDARE cm with Y up — the UE-native axis swap is handled for you.",
+      inputSchema: {
+        focus: z
+          .string()
+          .optional()
+          .describe(
+            "GUID or dotted path to frame. Measures the node's subtree bounds and places the camera to fit it — the easy way to look at a landmark.",
+          ),
+        position: z
+          .array(z.number())
+          .length(3)
+          .optional()
+          .describe("[X,Y,Z] camera position. Ignored when `focus` is given."),
+        lookAt: z
+          .array(z.number())
+          .length(3)
+          .optional()
+          .describe("[X,Y,Z] world point to face; the orientation is computed for you."),
+        orientation: z
+          .array(z.number())
+          .length(3)
+          .optional()
+          .describe("[pitch,yaw,roll] degrees. Negative pitch looks down. Overridden by `lookAt`."),
+        distance: z
+          .number()
+          .optional()
+          .describe("With `focus`: how far back to sit, in cm. Default fits the bounds."),
+        yaw: z
+          .number()
+          .optional()
+          .describe("With `focus`: compass angle to view from, degrees. Default 180 (looking +Z)."),
+        pitch: z
+          .number()
+          .optional()
+          .describe("With `focus`: downward tilt, degrees. Default -20."),
+      },
+    },
+    async (a: Json) => {
+      // The subsystem is reachable through its CDO; the function operates on the live
+      // editor viewport regardless. UE is Z-up, OVERDARE is Y-up, so the two axes swap.
+      const SUBSYS = "/Script/UnrealEd.Default__MUnrealEditorSubsystem";
+      const toUe = (p: number[]) => ({ X: p[0], Y: p[2], Z: p[1] });
+      const round = (n: number) => Math.round(n * 10) / 10;
+      try {
+        const wantsRead =
+          !a.focus && !a.position && !a.lookAt && !a.orientation;
+        if (wantsRead) {
+          const cur = (await rc.call(SUBSYS, "GetLevelViewportCameraInfo", {})) as Json;
+          const L = cur.CameraLocation as Record<string, number>;
+          const R = cur.CameraRotation as Record<string, number>;
+          return ok({
+            position: [round(L.X), round(L.Z), round(L.Y)],
+            rotation: { pitch: round(R.Pitch), yaw: round(R.Yaw), roll: round(R.Roll) },
+          });
+        }
+
+        let pos = a.position as number[] | undefined;
+        let target = a.lookAt as number[] | undefined;
+
+        if (a.focus) {
+          const doc = loadDoc(await getProjectFile());
+          const node = resolveNode(doc, a.focus as string);
+          if (!node) throw new Error(`focus not found: ${a.focus as string}`);
+          const b = subtreeBounds(node);
+          if (!b) throw new Error(`focus has no positioned geometry: ${a.focus as string}`);
+          target = [0, 1, 2].map((i) => (b.min[i] + b.max[i]) / 2);
+          const span = Math.max(...[0, 1, 2].map((i) => b.max[i] - b.min[i]), 100);
+          const dist = (a.distance as number | undefined) ?? span * 1.6;
+          const yr = (((a.yaw as number | undefined) ?? 180) * Math.PI) / 180;
+          const pr = (((a.pitch as number | undefined) ?? -20) * Math.PI) / 180;
+          // OVERDARE-space forward for that yaw/pitch, then step back along it.
+          const fwd = [-Math.sin(yr) * Math.cos(pr), Math.sin(pr), -Math.cos(yr) * Math.cos(pr)];
+          pos = [0, 1, 2].map((i) => Math.round(target![i] - fwd[i] * dist));
+        }
+
+        if (!pos) throw new Error("Provide `focus`, or `position` (with `lookAt` or `orientation`).");
+
+        let rot: { Pitch: number; Yaw: number; Roll: number };
+        if (target) {
+          // UE yaw measures from +X toward +Y; OVERDARE X/Z are UE X/Y.
+          const d = [0, 1, 2].map((i) => target![i] - pos![i]);
+          rot = {
+            Pitch: round((Math.atan2(d[1], Math.hypot(d[0], d[2])) * 180) / Math.PI),
+            Yaw: round((Math.atan2(d[2], d[0]) * 180) / Math.PI),
+            Roll: 0,
+          };
+        } else {
+          const o = (a.orientation as number[] | undefined) ?? [0, 0, 0];
+          rot = { Pitch: o[0], Yaw: o[1], Roll: o[2] };
+        }
+
+        await rc.call(SUBSYS, "SetLevelViewportCameraInfo", {
+          CameraLocation: toUe(pos),
+          CameraRotation: rot,
+        });
+        return ok({ position: pos, rotation: rot, lookAt: target ?? null });
       } catch (err) {
         return fail(err);
       }

@@ -138,6 +138,36 @@ function cframe(pos: V3, orient?: V3) {
   };
 }
 
+/**
+ * Axis-aligned bounds of everything positioned under `node` (inclusive of itself),
+ * in OVERDARE cm. A part contributes CFrame.Position ± Size/2; nodes without a
+ * transform are skipped but still walked, so a Folder of MeshParts measures as the
+ * whole landmark. Returns null when nothing under it has a position.
+ */
+export function subtreeBounds(node: OvNode): { min: number[]; max: number[] } | null {
+  const min = [Infinity, Infinity, Infinity];
+  const max = [-Infinity, -Infinity, -Infinity];
+  let any = false;
+  const num = (v: unknown) => (typeof v === "number" && Number.isFinite(v) ? v : 0);
+
+  const walk = (n: OvNode) => {
+    const p = (n.CFrame as { Position?: Record<string, unknown> } | undefined)?.Position;
+    if (p) {
+      const c = [num(p.X), num(p.Y), num(p.Z)];
+      const s = n.Size as Record<string, unknown> | undefined;
+      const h = s ? [num(s.X) / 2, num(s.Y) / 2, num(s.Z) / 2] : [0, 0, 0];
+      for (let i = 0; i < 3; i++) {
+        min[i] = Math.min(min[i], c[i] - h[i]);
+        max[i] = Math.max(max[i], c[i] + h[i]);
+      }
+      any = true;
+    }
+    for (const child of n.LuaChildren ?? []) walk(child);
+  };
+  walk(node);
+  return any ? { min, max } : null;
+}
+
 /** First existing instance of a class anywhere under root — used as a full-schema template. */
 export function findFirstByType(node: OvNode, type: string): OvNode | null {
   if (node.InstanceType === type) return node;
