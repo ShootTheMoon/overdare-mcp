@@ -52,6 +52,7 @@ for (const [id, v] of Object.entries(L)) {
   }
 }
 const norm = (s) => s.replace(/\./g, "_");
+const texBase = (s) => s.replace(/\.\d+$/, "");   // drop Blender's ".005" duplicate suffix
 
 // Which bundle each object landed in → its registered mesh name "rb_NN_<object>".
 // Build object → {meshName, sourceAsset, sourceFile-less}. genbundles recorded per bundle.
@@ -69,10 +70,24 @@ for (const b of bundles) {
 
 // asset (manifest key, e.g. HQ_Trabant) -> its converted file base (HQ_Trabant_overdare)
 // geom is keyed by file basename incl. _pNN. Map each object to its geom entry.
-const objGeom = {};       // objectName -> {center_m,dim_m,image}
+// An asset too big for one 30k file was split across several (_pNN), and each piece
+// file was re-exported around its OWN origin — so an object's center_m is relative to
+// its piece, not to the asset. The manifest records each piece's offset from the asset
+// centre; without adding it back the pieces of a landmark all collapse toward one spot.
+const fileOffset = {};    // file basename -> Blender-m offset from the asset centre
+for (const entry of Object.values(manifest)) {
+  for (const f of entry.files || []) {
+    if (f?.file) fileOffset[String(f.file)] = f.offset || [0, 0, 0];
+  }
+}
+
+const objGeom = {};       // objectName -> {center_m (asset space), dim_m, image}
 for (const [file, objs] of Object.entries(geom)) {
   if (objs.error) continue;
-  for (const [name, g] of Object.entries(objs)) objGeom[name] = g;
+  const off = fileOffset[file] || [0, 0, 0];
+  for (const [name, g] of Object.entries(objs)) {
+    objGeom[name] = { ...g, center_m: [0, 1, 2].map((i) => g.center_m[i] + (off[i] || 0)) };
+  }
 }
 
 // manifest key (HQ_Trabant) from converted asset base (HQ_Trabant_overdare or _overdare_pNN)
@@ -139,7 +154,12 @@ for (const inst of layout) {
     // exact bundle match first, then bundle-agnostic suffix fallback
     const meshId = idByName[meshName] || idBySuffix[norm(o.objName)];
     if (!meshId) { missing.add(meshName); continue; }
-    const texId = o.image ? idByName[norm(o.image)] : null;
+    // Blender appends a duplicate suffix (".005") to an image datablock reused across
+    // objects, but the texture registers under the base image name — so try the raw
+    // name, then the name with that suffix dropped, before giving up.
+    const texId = o.image
+      ? idByName[o.image] ?? idByName[texBase(o.image)] ?? idByName[norm(texBase(o.image))] ?? null
+      : null;
 
     // object center (Blender m, Z-up) -> OVERDARE cm (x, z, y), scaled, yaw-rotated in XZ
     const ox = o.center_m[0] * 100 * scale[0];
