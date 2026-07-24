@@ -80,6 +80,27 @@ CDO 경로로 호출해도 라이브 뷰포트에 적용된다. **좌표계 주�
 (Z-up)라서 `UE(x, y, z) = OVERDARE(X, Z, Y)`로 축을 바꿔야 한다. UE yaw는 +X에서 +Y로 잰다.
 `overdare_camera` 툴이 이 변환과 look-at/포커스 계산을 감싸고 있다.
 
+### 에디터 서브시스템 전체 지도 (RC로 열려 있는 것)
+
+바이너리에서 `*Subsystem` 96개를 뽑아 전수 describe한 결과, `/Script/SandboxPlugin`의 17개가
+응답한다. 전부 `/Script/UnrealEd.Default__<클래스>` CDO 경로로 호출하면 라이브 에디터에 먹는다.
+쓸 만한 것:
+
+| 서브시스템 | 함수 | 용도 |
+|---|---|---|
+| `MUnrealEditorSubsystem` | `Set/GetLevelViewportCameraInfo`, `GetEditorWorld` | 뷰포트 카메라, 월드 경로 |
+| `MLevelEditorSubsystem` | `EditorSet/GetGameView`, `EditorInvalidateViewports`, `IsInPlayInEditor`, `PilotLevelActor`, `SaveCurrentLevel` | 뷰포트 렌더 모드·재그리기·플레이 상태 |
+| `MEditorActorSubsystem` | `GetAllLevelActors`, `Get/SetSelectedLevelActors`, `SetActorSelectionState`, `SelectNothing/All`, `InvertSelection`, `DuplicateActor`, `DestroyActor` | 라이브 액터 열거·선택 |
+| `MEditorAssetSubsystem` | `ListAssets`, `DoesAssetExist`, `FindAssetData`, `SaveAsset`, `Duplicate/Rename/DeleteAsset` | 엔진 자산 레지스트리 |
+| `MLayersSubsystem` | 레이어 47종 | (OVERDARE UI에 노출 안 됨 — 미사용) |
+
+**주의**: 0-인자 함수는 raw curl로 `"parameters":{}`를 보내면 `Unable to deserialize request`가
+난다. MCP의 RC 클라이언트 경로로는 정상 동작한다.
+
+라이브 액터 경로는 `/User/<프로젝트>.<프로젝트>:PersistentLevel.LuaMeshPart_N` 형태이고
+**DataModel의 ActorGuid와 이름이 매칭되지 않는다** — 엔진 액터와 Luau 인스턴스를 잇는 값싼
+방법은 아직 없다. 그래서 선택 툴은 UE 경로를 받는다.
+
 **식별자**: 인스턴스는 `ActorGuid` (32자 hex). 세션이 바뀌어도 유지됨.
 
 **저장 형식**: `<프로젝트>\<이름>.ovdrjm` = JSON 트리.

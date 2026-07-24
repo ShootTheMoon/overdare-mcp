@@ -1020,6 +1020,139 @@ export function registerTools(server: McpServer, client: StudioRpcClient) {
     },
   );
 
+  // Every editor subsystem below answers on its CDO while still acting on the live
+  // editor — the same trick overdare_camera uses.
+  const EDSYS = (cls: string) => `/Script/UnrealEd.Default__${cls}`;
+  const LEVEL_ED = EDSYS("MLevelEditorSubsystem");
+  const ACTOR_ED = EDSYS("MEditorActorSubsystem");
+  const UNREAL_ED = EDSYS("MUnrealEditorSubsystem");
+  const retOf = (r: unknown) => (r as Json | undefined)?.ReturnValue;
+
+  server.registerTool(
+    "overdare_viewport",
+    {
+      description:
+        "Read or change how the editor viewport renders, which is what overdare_screenshot captures. `gameView` hides the editor-only overlay (grid, gizmo, billboards) for a clean shot; `invalidate` forces a redraw when a screenshot looks stale. Called with no arguments it just reports the current state.",
+      inputSchema: {
+        gameView: z
+          .boolean()
+          .optional()
+          .describe("true hides the editor overlay for clean screenshots; false restores it."),
+        invalidate: z.boolean().optional().describe("Force the viewport to redraw."),
+      },
+    },
+    async (a: Json) => {
+      try {
+        if (a.gameView !== undefined) {
+          await rc.call(LEVEL_ED, "EditorSetGameView", {
+            bGameView: a.gameView as boolean,
+            ViewportConfigKey: "",
+          });
+        }
+        if (a.invalidate) await rc.call(LEVEL_ED, "EditorInvalidateViewports", {});
+        const gv = await rc.call(LEVEL_ED, "EditorGetGameView", { ViewportConfigKey: "" });
+        const playing = await rc.call(LEVEL_ED, "IsInPlayInEditor", {});
+        return ok({ gameView: retOf(gv), isPlaying: retOf(playing) });
+      } catch (err) {
+        return fail(err);
+      }
+    },
+  );
+
+  server.registerTool(
+    "overdare_actors",
+    {
+      description:
+        "List the LIVE actors in the editor world with their Unreal object paths — the handles the selection and low-level Remote Control tools need. This is the engine's view, not the DataModel: use overdare_browse for the Luau tree and its GUIDs. Filter by substring and cap the count, since a built map runs to hundreds of actors.",
+      inputSchema: {
+        filter: z.string().optional().describe("Case-insensitive substring of the actor path."),
+        limit: z.number().optional().describe("Max paths to return (default 50)."),
+      },
+    },
+    async (a: Json) => {
+      try {
+        const all = (retOf(await rc.call(ACTOR_ED, "GetAllLevelActors", {})) ?? []) as string[];
+        const f = (a.filter as string | undefined)?.toLowerCase();
+        const hits = f ? all.filter((p) => p.toLowerCase().includes(f)) : all;
+        const limit = (a.limit as number | undefined) ?? 50;
+        const world = retOf(await rc.call(UNREAL_ED, "GetEditorWorld", {}));
+        return ok({ world, total: all.length, matched: hits.length, actors: hits.slice(0, limit) });
+      } catch (err) {
+        return fail(err);
+      }
+    },
+  );
+
+  server.registerTool(
+    "overdare_selection",
+    {
+      description:
+        "Read or change the editor's actor selection — handy for showing the user what you are talking about, since selected actors are outlined in the viewport (and in a screenshot). Takes Unreal actor paths from overdare_actors, not DataModel GUIDs. With no arguments it reports the current selection.",
+      inputSchema: {
+        actors: z
+          .array(z.string())
+          .optional()
+          .describe("Actor paths to select (replaces the selection unless `add` is true)."),
+        add: z.boolean().optional().describe("Add to the selection instead of replacing it."),
+        clear: z.boolean().optional().describe("Deselect everything."),
+        all: z.boolean().optional().describe("Select every actor in the level."),
+        invert: z.boolean().optional().describe("Invert the current selection."),
+      },
+    },
+    async (a: Json) => {
+      try {
+        const world = retOf(await rc.call(UNREAL_ED, "GetEditorWorld", {})) as string;
+        if (a.clear || (a.actors && !a.add)) await rc.call(ACTOR_ED, "SelectNothing", {});
+        if (a.all) await rc.call(ACTOR_ED, "SelectAll", { InWorld: world });
+        if (a.invert) await rc.call(ACTOR_ED, "InvertSelection", { InWorld: world });
+        for (const p of (a.actors as string[] | undefined) ?? []) {
+          await rc.call(ACTOR_ED, "SetActorSelectionState", { Actor: p, bShouldBeSelected: true });
+        }
+        const sel = (retOf(await rc.call(ACTOR_ED, "GetSelectedLevelActors", {})) ?? []) as string[];
+        return ok({ selected: sel.length, actors: sel.slice(0, 50) });
+      } catch (err) {
+        return fail(err);
+      }
+    },
+  );
+
+  server.registerTool(
+    "overdare_engine_assets",
+    {
+      description:
+        "Query the engine's asset registry — what Unreal actually has loaded, as opposed to UGCLocalAssetTable.json (the project's own contentId registry, which only updates on save). Useful for confirming an import really landed: freshly imported meshes and textures appear under /Asset/TempImportedAssetDir. Pass `directory` to list, or `assetPath` to test one.",
+      inputSchema: {
+        directory: z
+          .string()
+          .optional()
+          .describe('Directory to list, e.g. "/Asset/TempImportedAssetDir". Default that path.'),
+        recursive: z.boolean().optional().describe("Recurse into subdirectories (default true)."),
+        assetPath: z.string().optional().describe("Instead of listing, test whether this asset exists."),
+        limit: z.number().optional().describe("Max entries to return (default 100)."),
+      },
+    },
+    async (a: Json) => {
+      const ASSET_ED = EDSYS("MEditorAssetSubsystem");
+      try {
+        if (a.assetPath) {
+          const r = await rc.call(ASSET_ED, "DoesAssetExist", { AssetPath: a.assetPath as string });
+          return ok({ assetPath: a.assetPath, exists: retOf(r) });
+        }
+        const dir = (a.directory as string | undefined) ?? "/Asset/TempImportedAssetDir";
+        const r = await rc.call(ASSET_ED, "ListAssets", {
+          DirectoryPath: dir,
+          bRecursive: (a.recursive as boolean | undefined) ?? true,
+          bIncludeFolder: false,
+        });
+        const list = (retOf(r) ?? []) as string[];
+        const limit = (a.limit as number | undefined) ?? 100;
+        return ok({ directory: dir, total: list.length, assets: list.slice(0, limit) });
+      } catch (err) {
+        return fail(err);
+      }
+    },
+  );
+
   server.registerTool(
     "overdare_move_instance",
     {
