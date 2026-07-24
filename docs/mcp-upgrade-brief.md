@@ -108,8 +108,29 @@ World 컨텍스트는 `MUnrealEditorSubsystem.GetEditorWorld` 가 주는 `/User/
 cvar 읽기는 `GetConsoleVariable{Float,Int,Bool,String}Value`. `overdare_console` 툴이 감싼다.
 명령이 그대로 실행되므로 `quit` 같은 건 세션을 끊는다 — 전용 툴이 있으면 그쪽을 쓸 것.
 
-찾다가 **안 된 것**: Lua 실행 경로(`LuaSubsystem` 계열은 CDO가 안 잡힘),
-`MEditorCommandAPISubsystem`(실질 함수 없음), `MSandboxSubsystem`/`MToolMenuSubsystem`(미해결).
+### ⚠️ `/remote/batch` 는 Studio를 죽인다
+
+프로퍼티 읽기 5건을 `PUT /remote/batch` 로 묶어 보냈더니 연결이 리셋되고 Studio가
+`EXCEPTION_ACCESS_VIOLATION (0x18 읽기)` 로 즉사했다. **이 엔드포인트는 쓰지 마라.**
+RC 호출은 반드시 건별로 보낸다.
+
+### Lua는 서브시스템이 아니라 액터다 — 라이브 프로퍼티 접근
+
+`LuaSubsystem`/`LuaGameInstanceSubsystem` CDO는 존재하지 않는다. **Lua 코드 실행 경로는 없다.**
+대신 DataModel 인스턴스가 곧 레벨 액터이고 RC로 직접 읽고 쓸 수 있다:
+
+```
+/User/<프로젝트>.<프로젝트>:PersistentLevel.LuaMeshPart_<N>   → /Script/LuaAPI.LuaMeshPart (속성 113개)
+  Name, MeshId, TextureId, bHiddenEd, ...
+```
+
+`Name` 이 DataModel 인스턴스 이름과 같으므로 액터↔인스턴스를 이름으로 이을 수 있다. 다만
+액터 경로에는 ActorGuid가 없고 batch가 막혀 있어 **수백 개를 일괄 매핑하는 값싼 방법은 없다**
+(건별 요청뿐).
+
+찾다가 **정말로 없는 것**: `MEditorCommandAPISubsystem`(함수 없음),
+`MSandboxSubsystem`·`MUserMetaDataSubsystem`(`/Script/Sandbox` 에서 해결되지만 함수 0개),
+`MToolMenuSubsystem`(어느 패키지에서도 미해결).
 
 라이브 액터 경로는 `/User/<프로젝트>.<프로젝트>:PersistentLevel.LuaMeshPart_N` 형태이고
 **DataModel의 ActorGuid와 이름이 매칭되지 않는다** — 엔진 액터와 Luau 인스턴스를 잇는 값싼
