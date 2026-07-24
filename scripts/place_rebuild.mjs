@@ -76,17 +76,49 @@ for (const b of bundles) {
   }
 }
 
-// asset (manifest key, e.g. HQ_Trabant) -> its converted file base (HQ_Trabant_overdare)
-// geom is keyed by file basename incl. _pNN. Map each object to its geom entry.
-// An asset too big for one 30k file was split across several (_pNN), and each piece
-// file was re-exported around its OWN origin — so an object's center_m is relative to
-// its piece, not to the asset. The manifest records each piece's offset from the asset
-// centre; without adding it back the pieces of a landmark all collapse toward one spot.
-const fileOffset = {};    // file basename -> Blender-m offset from the asset centre
-for (const entry of Object.values(manifest)) {
-  for (const f of entry.files || []) {
-    if (f?.file) fileOffset[String(f.file)] = f.offset || [0, 0, 0];
+// geom is keyed by file basename incl. _pNN. An object's center_m is measured FROM the
+// converted FBX, so it is already the position OVERDARE will import the piece at. The
+// manifest also records a per-file offset from the asset centre — but that is only a
+// real correction for assets whose split files were re-exported around their OWN origin
+// (their pieces would otherwise stack at one point). For assets whose pieces kept their
+// position in the FBX, center_m is already correct and adding the offset DOUBLE-counts,
+// shearing the internal assembly (the whole reason the gate looked "not quite right").
+//
+// Decide per asset by reconstruction: assemble from center_m alone and compare to the
+// authored orig_dims. If it collapses (much smaller than orig on some axis) the pieces
+// are stacked → apply the offset; if it already matches orig, the offset is spurious.
+const fileToAsset = {};   // file basename -> manifest key
+const assetNeedsOffset = {};
+for (const [key, entry] of Object.entries(manifest)) {
+  for (const f of entry.files || []) if (f?.file) fileToAsset[String(f.file)] = key;
+}
+for (const [key, entry] of Object.entries(manifest)) {
+  if (!entry.files || entry.files.length < 2) { assetNeedsOffset[key] = false; continue; }
+  const mn = [1e9, 1e9, 1e9], mx = [-1e9, -1e9, -1e9];
+  let any = false;
+  for (const f of entry.files) {
+    const objs = geom[f.file];
+    if (!objs || objs.error) continue;
+    for (const g of Object.values(objs)) {
+      any = true;
+      for (let a = 0; a < 3; a++) {
+        mn[a] = Math.min(mn[a], g.center_m[a] - g.dim_m[a] / 2);
+        mx[a] = Math.max(mx[a], g.center_m[a] + g.dim_m[a] / 2);
+      }
+    }
   }
+  const od = entry.orig_dims || [0, 0, 0];
+  const minRatio = any
+    ? Math.min(...[0, 1, 2].map((a) => (od[a] > 0 ? (mx[a] - mn[a]) / od[a] : 1)))
+    : 1;
+  // Collapsed on some axis → the FBX stacked the pieces → the offset is the real fix.
+  assetNeedsOffset[key] = any && minRatio < 0.7;
+}
+
+const fileOffset = {};    // file basename -> Blender-m offset, only where the asset needs it
+for (const [key, entry] of Object.entries(manifest)) {
+  if (!assetNeedsOffset[key]) continue;
+  for (const f of entry.files || []) if (f?.file) fileOffset[String(f.file)] = f.offset || [0, 0, 0];
 }
 
 const objGeom = {};       // objectName -> {center_m (asset space), dim_m, image}
