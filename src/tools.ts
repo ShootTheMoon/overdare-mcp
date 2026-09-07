@@ -240,18 +240,36 @@ export function registerTools(server: McpServer, client: StudioRpcClient) {
   );
 
   // ---- Scripts (Luau) ----------------------------------------------------
-  tool(
+  server.registerTool(
     "overdare_script_add",
-    "Create a Luau script under a parent instance (found via overdare_browse). Use TABS for indentation. Good parents: ServerScriptService (Script), StarterPlayer.StarterPlayerScripts (LocalScript), ReplicatedStorage (ModuleScript).",
     {
-      class: z
-        .enum(["Script", "LocalScript", "ModuleScript"])
-        .describe("Script kind: Script=server, LocalScript=client, ModuleScript=shared library."),
-      parentGuid: z.string().describe("GUID of the parent instance (from overdare_browse)."),
-      name: z.string().describe("Script name."),
-      source: z.string().describe("Luau source code (tabs for indentation)."),
+      description:
+        "Create a Luau script under a parent instance. Use TABS for indentation. Good parents: ServerScriptService (Script), StarterPlayer.StarterPlayerScripts (LocalScript), ReplicatedStorage (ModuleScript). Edits the project file and reloads, like overdare_script_edit — STOP any playtest first. Check the result with overdare_validate_lua.",
+      inputSchema: {
+        class: z
+          .enum(["Script", "LocalScript", "ModuleScript"])
+          .describe("Script kind: Script=server, LocalScript=client, ModuleScript=shared library."),
+        parent: z.string().describe("Parent GUID or dotted path (from overdare_find or overdare_browse)."),
+        name: z.string().describe("Script name."),
+        source: z.string().describe("Luau source code (tabs for indentation)."),
+        enabled: z.boolean().optional().describe("Defaults to enabled."),
+      },
     },
-    "script.add",
+    async (a: Json) => {
+      try {
+        const out = await applyEdit((doc) => {
+          const parent = resolveNode(doc, a.parent as string);
+          if (!parent) throw new Error(`Parent not found: ${a.parent}`);
+          const node = createInstance(doc, parent, a.class as string, a.name as string, {});
+          node.Source = a.source as string;
+          node.Enabled = (a.enabled as boolean | undefined) ?? true;
+          return { guid: node.ActorGuid, name: node.Name, class: node.InstanceType, enabled: node.Enabled };
+        });
+        return ok({ ...(out.result as Json), backup: out.backup });
+      } catch (err) {
+        return fail(err);
+      }
+    },
   );
 
   // ---- Mutate ------------------------------------------------------------
