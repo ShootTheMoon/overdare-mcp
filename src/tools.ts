@@ -34,12 +34,14 @@ import {
   readFileSync,
   writeFileSync,
   mkdtempSync,
+  mkdirSync,
+  copyFileSync,
   rmSync,
 } from "node:fs";
 import { tmpdir, homedir } from "node:os";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
-import { dirname, join } from "node:path";
+import { dirname, join, basename } from "node:path";
 import { fileURLToPath } from "node:url";
 import { z } from "zod";
 import { flatten, ABSENT_CLASSES } from "./props.js";
@@ -1014,13 +1016,45 @@ export function registerTools(server: McpServer, client: StudioRpcClient) {
     );
   }
 
+  /**
+   * Copy the level aside before overwriting it, keeping the last few copies.
+   *
+   * Every file-backed tool rewrites the whole level in place, and the level is
+   * the game — a bad edit, or a crash between write and reload, takes the
+   * project with it. Studio's own undo does not reach a file changed underneath
+   * it either. Cheap insurance; the file is a few MB.
+   */
+  function backupLevel(file: string): string | null {
+    try {
+      const dir = join(dirname(file), ".ovdr-backups");
+      if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
+      const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+      const dest = join(dir, `${basename(file)}.${stamp}`);
+      copyFileSync(file, dest);
+
+      const keep = 10;
+      const mine = readdirSync(dir)
+        .filter((f) => f.startsWith(`${basename(file)}.`))
+        .sort();
+      for (const old of mine.slice(0, Math.max(0, mine.length - keep)))
+        rmSync(join(dir, old), { force: true });
+
+      return dest;
+    } catch {
+      // A failed backup must not block the edit the caller asked for; the
+      // return value says whether one exists.
+      return null;
+    }
+  }
+
   async function applyEdit(mutate: (doc: ReturnType<typeof loadDoc>) => unknown) {
     const file = await getProjectFile();
     const doc = loadDoc(file);
     const result = mutate(doc);
+    const backup = backupLevel(file);
     saveDoc(file, doc);
     const apply = await client.call("level.apply", {});
-    return { result, apply };
+    return { result, apply, backup };
   }
 
   server.registerTool(
