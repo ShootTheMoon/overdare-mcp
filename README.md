@@ -12,9 +12,16 @@ OVERDARE Studio already hosts a local JSON-RPC server (the same one its built-in
 there's no plugin to install.
 
 ```
-Claude  ──stdio──▶  overdare-mcp  ──HTTP POST──▶  Studio RPC (localhost:13377/rpc)
-                                                      └─ OVERDARE Studio (must be running)
+Claude  ──stdio──▶  overdare-mcp  ──raw TCP──▶  Studio RPC        (127.0.0.1:13377)
+                                  ──HTTP────▶  UE Remote Control (127.0.0.1:30010)
+                                                  └─ OVERDARE Studio (must be running)
 ```
+
+Port 13377 is **not** HTTP. It is newline-delimited JSON-RPC 2.0 straight over a
+TCP socket, one connection per call — speaking HTTP at it yields a protocol
+violation instead of a response. Remote Control on 30010 *is* HTTP, and is a
+separate surface (the `overdare_rc_*` tools) that reaches the Unreal editor
+underneath rather than the OVERDARE DataModel.
 
 > Studio must be open with a project for tools to work. If Studio isn't running,
 > tools return a clear "cannot reach Studio" error instead of hanging.
@@ -55,31 +62,99 @@ For **Claude Desktop**, add the same block under `mcpServers` in
 
 | Var | Default | Purpose |
 | --- | --- | --- |
-| `STUDIO_RPC_HOST` | `localhost` | Studio RPC host |
-| `STUDIO_RPC_PORT` | `13377` | Studio RPC port |
-| `STUDIO_RPC_TIMEOUT_MS` | `30000` | Per-call timeout |
+| `STUDIO_HOST` | `localhost` | Studio RPC host (`STUDIO_RPC_HOST` also accepted) |
+| `STUDIO_PORT` | `13377` | Studio RPC port (`STUDIO_RPC_PORT` also accepted) |
+| `STUDIO_RPC_TIMEOUT_MS` | `10000` | Per-call timeout |
+| `OVERDARE_PROJECT_DIR` | auto-detected | Fallback project directory for the file-backed tools |
+| `OVERDARE_BLENDER` | auto-detected | Blender executable used by `overdare_mesh_prepare` |
 
 ## Tools
 
-| Tool | RPC method | Purpose |
+Three backends sit behind these, and the difference matters when something
+fails. **RPC** talks to Studio live over 13377. **File** edits the saved
+`.ovdrjm` and asks Studio to reload, which is how the tools whose RPC method
+does not exist are implemented — stop any playtest before using those. **RC**
+is Unreal Remote Control on 30010.
+
+### Reading
+
+| Tool | Via | Purpose |
 | --- | --- | --- |
-| `overdare_level_browse` | `level.browse` | Browse the DataModel tree |
-| `overdare_level_save` | `level.save.file` | Save the project |
-| `overdare_level_apply` | `level.apply` | Apply a batch change set (advanced) |
-| `overdare_level_publish` | `level.publish` | Publish to the OVERDARE Hub |
-| `overdare_instance_read` | `instance.read` | Read one instance's properties |
-| `overdare_instance_upsert` | `instance.upsert` | Create / update an instance |
-| `overdare_instance_move` | `instance.move` | Reparent an instance |
-| `overdare_instance_delete` | `instance.delete` | Delete an instance |
-| `overdare_script_read` | `script.read` | Read Luau source |
-| `overdare_script_add` | `script.add` | Create a script |
-| `overdare_script_edit` | `script.edit` | Replace script source |
-| `overdare_script_delete` | `script.delete` | Delete a script |
-| `overdare_script_grep` | `script.grep` | Regex search across scripts |
-| `overdare_game_play` | `game.play` | Start a playtest |
-| `overdare_game_stop` | `game.stop` | Stop the playtest |
-| `overdare_game_screenshot` | `game.screenshot` | Capture the viewport |
-| `overdare_rpc` | _any_ | Escape hatch: call any RPC method with raw params |
+| `overdare_browse` | RPC `level.browse` | Browse the DataModel tree. Start here — everything else targets `guid` |
+| `overdare_find` | File | Search by name substring and/or class; far more practical than browsing a large project |
+| `overdare_read_instance` | File | Read one instance's properties as saved |
+| `overdare_script_read` | File | Read a script's Luau source |
+| `overdare_status` | — | Report what is reachable and configured |
+
+### Editing
+
+| Tool | Via | Purpose |
+| --- | --- | --- |
+| `overdare_create_part` | File | Create a Part |
+| `overdare_create_instance` | File | Create one instance of any class |
+| `overdare_create_instances` | File | Bulk-create under one parent in a single reload |
+| `overdare_update_instance` | File | Change properties and/or rename |
+| `overdare_move_instance` | File | Reparent |
+| `overdare_duplicate_instance` | File | Copy a subtree with fresh GUIDs |
+| `overdare_delete_instance` | File | Delete by GUID |
+| `overdare_instance_delete` | RPC `instance.delete` | Delete live, without a reload |
+| `overdare_script_add` | File | Create a Script / LocalScript / ModuleScript |
+| `overdare_script_edit` | File | Replace a script's source, or toggle `Enabled` |
+
+### Project lifecycle
+
+| Tool | Via | Purpose |
+| --- | --- | --- |
+| `overdare_save` | RPC `level.save.file` | Save the project to disk |
+| `overdare_apply` | RPC `level.apply` | Reload pending level changes |
+| `overdare_publish` | RPC `level.publish` | Publish to the Hub (owner only) |
+| `overdare_set_project` | — | Re-detect or pin the project directory |
+
+### Playtest and viewport
+
+| Tool | Via | Purpose |
+| --- | --- | --- |
+| `overdare_play` / `overdare_stop` | RPC `game.play` / `game.stop` | Start / stop a playtest |
+| `overdare_screenshot` | RPC `game.screenshot` | Capture the viewport and return the image. UI is included |
+| `overdare_camera` | RC | Aim the editor camera before a screenshot |
+| `overdare_viewport` | RC | Read or change how the editor viewport renders |
+
+### Assets
+
+| Tool | Via | Purpose |
+| --- | --- | --- |
+| `overdare_assets` | — | List the curated Asset Drawer catalog |
+| `overdare_asset_import` | RPC | Import an Asset Drawer model by id |
+| `overdare_image_import` | RPC | Import a local PNG/JPG into the asset manager |
+| `overdare_mesh_prepare` | Blender | Make a 3D file import-ready (see below) |
+| `overdare_mesh_bulk_import` | GUI | Drive many prepared meshes through the import dialog |
+| `overdare_engine_assets` | RC | Query the engine asset registry |
+| `overdare_rc_search_assets` | RC | Search the Unreal asset library |
+
+### Unreal Remote Control (low level)
+
+| Tool | Purpose |
+| --- | --- |
+| `overdare_rc_call` | Call a UFunction on an Unreal object |
+| `overdare_rc_property` | Read or write a property |
+| `overdare_rc_describe` | Describe an object's properties and functions |
+| `overdare_rc_list_actors` / `overdare_actors` | Enumerate live actors and their object paths |
+| `overdare_selection` | Read or change the editor's actor selection |
+| `overdare_console` | Run a console command or read a cvar |
+| `overdare_rc_batch` | Several RC requests in one round-trip |
+| `overdare_rc_python` | Run an Unreal Python command |
+
+`overdare_rc_batch` and `overdare_rc_python` do not work against a shipping
+Studio build: `PUT /remote/batch` has crashed Studio outright, and
+`ExecutePythonCommand` returns 400 because the Python plugin is not loaded.
+They are kept for builds that do support them.
+
+### Escape hatch
+
+| Tool | Purpose |
+| --- | --- |
+| `overdare_rpc` | Call any Studio RPC method with raw params |
+| `overdare_recipe` | Read a build recipe adapted from the built-in agent's skills |
 
 ## Smart mesh import (`overdare_mesh_prepare`)
 
@@ -103,10 +178,26 @@ Studio** (recovered from its screenshot path). After switching projects in
 Studio, call `overdare_set_project` with no args to re-detect, or pass a `dir` to
 pin a specific project directory. `OVERDARE_PROJECT_DIR` remains a fallback.
 
-## Status / next steps
+## Which RPC methods actually exist
 
-The RPC endpoint, port, and method names were derived from the OVERDARE Studio
-runtime. The exact **param/response field shapes** for each method still need to
-be confirmed against a live Studio — use `npm run probe -- <method> '<json>'`
-to capture real shapes, then tighten the Zod schemas in `src/tools.ts`. The
-`overdare_rpc` tool works regardless and is the safe fallback while iterating.
+Method names were originally read out of the Studio runtime, and several of them
+turned out not to be dispatchable. Probed against a live Studio (2026-09-07):
+
+**Present.** `level.browse` · `level.apply` · `level.save.file` ·
+`level.publish` · `instance.create` · `instance.update` · `instance.read` ·
+`instance.move` · `instance.delete` · `game.play` · `game.stop` ·
+`game.screenshot` · `game.observe` · `game.ui.browse` · `game.pie.status` ·
+`game.character.read` · `game.input.inject` · `viewport.camera.read` ·
+`viewport.camera.set` · `hub.token.read`
+
+**Absent** — these return `-32601`, so anything routed to them fails: every
+`script.*` method, `instance.upsert`, `procedural.run`, the asset-import
+methods, and `validatelua`. They belong to the bundled agent, not to the RPC
+surface. The script and instance tools here go through the project file instead,
+which is why they carry the "stop the playtest first" caveat.
+
+There is no discovery method — `rpc.discover` and `system.listMethods` are both
+absent. To check whether a method exists, call it with empty params and read the
+error: `-32601` means no such method, anything else means it is there.
+`npm run probe -- <method> '<json>'` does this, and `overdare_rpc` is the
+fallback for a method with no dedicated tool.
