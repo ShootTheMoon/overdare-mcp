@@ -73,8 +73,9 @@ For **Claude Desktop**, add the same block under `mcpServers` in
 Three backends sit behind these, and the difference matters when something
 fails. **RPC** talks to Studio live over 13377. **File** edits the saved
 `.ovdrjm` and asks Studio to reload, which is how the tools whose RPC method
-does not exist are implemented — stop any playtest before using those. **RC**
-is Unreal Remote Control on 30010.
+does not exist are implemented — stop any playtest before using those. Each such
+edit first copies the level into `.ovdr-backups/` beside it, keeping the last
+ten, and reports the path it wrote. **RC** is Unreal Remote Control on 30010.
 
 ### Reading
 
