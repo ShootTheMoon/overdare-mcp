@@ -24,7 +24,19 @@
  */
 
 import { readFile } from "node:fs/promises";
-import { existsSync, readdirSync, statSync, openSync, readSync, closeSync, readFileSync } from "node:fs";
+import {
+  existsSync,
+  readdirSync,
+  statSync,
+  openSync,
+  readSync,
+  closeSync,
+  readFileSync,
+  writeFileSync,
+  mkdtempSync,
+  rmSync,
+} from "node:fs";
+import { tmpdir, homedir } from "node:os";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { dirname, join } from "node:path";
@@ -33,6 +45,23 @@ import { z } from "zod";
 import { flatten, ABSENT_CLASSES } from "./props.js";
 
 const execFileP = promisify(execFile);
+
+/**
+ * Studio ships luau-lsp and the OVERDARE type definitions alongside its bundled
+ * agent. The version folder moves on update, so read it from runtime-current
+ * rather than hard-coding one.
+ */
+function runtimeAsset(...parts: string[]): string | null {
+  const base = join(homedir(), ".overdare", "updates");
+  try {
+    const cur = JSON.parse(readFileSync(join(base, "runtime-current.json"), "utf8")) as { dir?: string };
+    if (!cur.dir) return null;
+    const p = join(base, cur.dir, ...parts);
+    return existsSync(p) ? p : null;
+  } catch {
+    return null;
+  }
+}
 
 /** Read the last N bytes of a (possibly huge) file. */
 function tailFile(path: string, bytes = 512 * 1024): string {
@@ -1638,6 +1667,74 @@ export function registerTools(server: McpServer, client: StudioRpcClient) {
         return ok(out.result);
       } catch (err) {
         return fail(err);
+      }
+    },
+  );
+
+  server.registerTool(
+    "overdare_validate_lua",
+    {
+      description:
+        "Type-check Luau with luau-lsp against the OVERDARE type definitions, either scripts already in the project (by GUID or dotted path) or files on disk. Instance property errors are the ones that matter — they catch calls against an API this build no longer has, which otherwise only surface as a runtime warning in the log. Lint noise like an unused local is not worth acting on.",
+      inputSchema: {
+        refs: z
+          .array(z.string().min(1))
+          .optional()
+          .describe("Script GUIDs or dotted paths in the project. Their Source is checked."),
+        files: z.array(z.string().min(1)).optional().describe("Absolute paths to .lua files."),
+      },
+    },
+    async (a: Json) => {
+      const lsp = runtimeAsset("assets", "bin", "luau-lsp.exe");
+      if (!lsp) return errOut("luau-lsp not found under ~/.overdare/updates/<version>/assets/bin — is Studio installed?");
+      const defs = runtimeAsset("assets", "lua", "overdare-types.d.lua");
+
+      const refs = (a.refs as string[] | undefined) ?? [];
+      const files = [...((a.files as string[] | undefined) ?? [])];
+      if (!refs.length && !files.length) return errOut("Provide refs and/or files.");
+
+      // Scripts live in the project as a Source string, so they have to be
+      // written out before luau-lsp can see them. Name the temp file after the
+      // script: luau-lsp reports by path, and a name is what makes the report
+      // readable when several are checked at once.
+      let scratch: string | null = null;
+      try {
+        if (refs.length) {
+          const doc = loadDoc(await getProjectFile());
+          scratch = mkdtempSync(join(tmpdir(), "ovdr-lua-"));
+          for (const ref of refs) {
+            const node = resolveNode(doc, ref);
+            if (!node) return errOut(`Not found: ${ref}`);
+            if (node.Source === undefined)
+              return errOut(`Not a script (no Source field): ${ref} [${node.InstanceType}]`);
+            const p = join(scratch, `${String(node.Name).replace(/[^\w.-]/g, "_")}.lua`);
+            writeFileSync(p, String(node.Source), "utf8");
+            files.push(p);
+          }
+        }
+
+        const missing = files.filter((f) => !existsSync(f));
+        if (missing.length) return errOut(`No such file: ${missing.join(", ")}`);
+
+        const args = ["analyze", ...(defs ? [`--definitions=${defs}`] : []), ...files];
+        // luau-lsp exits non-zero when it finds problems, which execFile treats
+        // as a failure — the diagnostics are on stdout either way.
+        const out = await execFileP(lsp, args, { maxBuffer: 32 * 1024 * 1024 }).then(
+          (r) => `${r.stdout}${r.stderr}`,
+          (e: { stdout?: string; stderr?: string; message?: string }) =>
+            `${e.stdout ?? ""}${e.stderr ?? ""}` || e.message || "",
+        );
+        const text = out.trim();
+        return ok({
+          checked: files.length,
+          definitions: defs ?? "(none — results will be far weaker)",
+          clean: text === "",
+          output: text || "No problems found.",
+        });
+      } catch (err) {
+        return fail(err);
+      } finally {
+        if (scratch) rmSync(scratch, { recursive: true, force: true });
       }
     },
   );

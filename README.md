@@ -84,7 +84,19 @@ is Unreal Remote Control on 30010.
 | `overdare_find` | File | Search by name substring and/or class; far more practical than browsing a large project |
 | `overdare_read_instance` | File | Read one instance's properties as saved |
 | `overdare_script_read` | File | Read a script's Luau source |
+| `overdare_validate_lua` | luau-lsp | Type-check scripts against the OVERDARE type definitions |
 | `overdare_status` | — | Report what is reachable and configured |
+
+`overdare_validate_lua` runs the `luau-lsp` and `overdare-types.d.lua` that ship
+beside Studio's bundled agent, so it knows the real API surface — it will tell
+you that `Key 'Bold' not found in external type 'TextLabel'`, which is exactly
+the kind of break an engine update causes and that otherwise only shows up as a
+runtime warning in `Sandbox.log`. It takes scripts already in the project (by
+GUID or dotted path, as `overdare_find` reports them) or files on disk.
+
+Its blind spot is worth knowing: a local from `Instance.new("TextLabel")` is not
+narrowed to `TextLabel`, so property errors on that local go unreported. Annotate
+the local, or check the value at runtime with `overdare_observe`.
 
 ### Editing
 
