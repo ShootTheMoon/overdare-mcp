@@ -1,12 +1,23 @@
 /**
  * MCP tool definitions for OVERDARE Studio.
  *
- * Each tool maps to a Studio RPC method (see rpcClient.ts). Schemas reflect the
- * methods VERIFIED against a live Studio build:
- *   working : level.browse, level.apply, level.save.file, level.publish,
- *             game.play/stop/screenshot, script.add, instance.delete
- *   absent  : instance.read/upsert/move, script.read/edit/grep (server returns
- *             -32002 on this build) — reachable later via the .ovdrjm edit path.
+ * Each tool maps to a Studio RPC method (see rpcClient.ts), to an edit of the
+ * saved .ovdrjm, or to Unreal Remote Control. Probed against a live Studio
+ * (2026-09-07):
+ *
+ *   present : level.browse/apply/save.file/publish,
+ *             instance.create/update/read/move/delete,
+ *             game.play/stop/screenshot/observe/ui.browse/pie.status/
+ *             character.read/input.inject,
+ *             viewport.camera.read/set, hub.token.read
+ *   absent  : every script.* method, instance.upsert, procedural.run, the
+ *             asset-import methods, validatelua. They live in the bundled
+ *             agent, not on this socket, and return -32601 here. The script
+ *             and instance tools go through the .ovdrjm edit path instead.
+ *
+ * There is no discovery method — rpc.discover and system.listMethods are both
+ * absent. To test whether a method exists, call it with empty params: -32601
+ * means no such method, any other error means it is there.
  *
  * The model drives Studio by GUID: call overdare_browse first to learn the
  * tree, then act on nodes by their `guid`.
@@ -263,29 +274,181 @@ export function registerTools(server: McpServer, client: StudioRpcClient) {
     "overdare_screenshot",
     {
       description:
-        "Capture the live Studio viewport / running game and return the image so you can visually verify the scene. Great for 'visual-first' iteration: change something, then look.",
-      inputSchema: {},
+        "Capture the live Studio viewport / running game and return the image so you can visually verify the scene. Great for 'visual-first' iteration: change something, then look. On-screen UI is included unless you turn it off. `locate` projects world positions or instance names into the same 0..1 viewport coordinates overdare_input_inject clicks in, so you can find a thing and then click it.",
+      inputSchema: {
+        includeGui: z
+          .boolean()
+          .optional()
+          .describe("Include on-screen UI. Defaults to true; false renders the world alone."),
+        locate: z
+          .array(
+            z.union([
+              z.string().describe("Instance name or dotted path."),
+              z.object({
+                x: z.number(),
+                y: z.number(),
+                z: z.number(),
+                label: z.string().optional().describe("Echoed back on the result."),
+              }),
+            ]),
+          )
+          .max(32)
+          .optional()
+          .describe("World positions or instances to project into viewport coordinates."),
+      },
     },
-    async () => {
+    async (a: Json) => {
       try {
-        const res = (await client.call("game.screenshot", {})) as {
+        const res = (await client.call("game.screenshot", clean(a))) as {
           path?: string;
           success?: boolean;
+          [k: string]: unknown;
         };
         const path = res?.path;
         if (!path) return ok(res);
         try {
           const buf = await readFile(path);
+          // Everything but the image bytes still matters — camera axes and the
+          // projected `locate` coordinates are the reason to ask for a shot.
+          const { path: _p, ...rest } = res;
           return {
             content: [
               { type: "image" as const, data: buf.toString("base64"), mimeType: "image/png" },
-              { type: "text" as const, text: `Saved: ${path}` },
+              { type: "text" as const, text: `Saved: ${path}\n${JSON.stringify(rest, null, 2)}` },
             ],
           };
         } catch {
           // Couldn't read the file (e.g. path on another machine) — return path only.
           return ok(res);
         }
+      } catch (err) {
+        return fail(err);
+      }
+    },
+  );
+
+  // ======================================================================
+  //  RUNTIME OBSERVATION  (only meaningful while a playtest is running)
+  //
+  //  A screenshot shows pixels and the saved project shows what was authored.
+  //  Neither shows what the running game currently holds, which is where UI
+  //  bugs live: a label the script rewrote, a frame a layout pushed off
+  //  screen, a button covered by something with a higher ZIndex. These read
+  //  that, and input_inject drives it, so a UI change can be checked without
+  //  a human playing a round.
+  // ======================================================================
+
+  tool(
+    "overdare_pie_status",
+    "Report whether a playtest is running and which clients can take injected input. Call this before observing or injecting — every tool below fails without a live client.",
+    {},
+    "game.pie.status",
+  );
+
+  tool(
+    "overdare_character_read",
+    "Read the playing character's CFrame, speed, facing, and what it is standing on.",
+    {},
+    "game.character.read",
+  );
+
+  tool(
+    "overdare_ui_browse",
+    "List the running client's UI as flat elements: dotted path, class, text, normalized rect and centre, visibility, and whether each is on screen. This is the live tree, so it reflects what scripts have done to it — unlike overdare_read_instance, which reads the saved project. Narrow with `paths` on a large HUD.",
+    {
+      paths: z
+        .array(z.string().min(1))
+        .optional()
+        .describe('Element names, dotted paths, or on-screen labels. A trailing ".*" takes the subtree.'),
+      fields: z
+        .array(z.string().min(1))
+        .optional()
+        .describe("Keep only these fields; `path` and `class` always come back."),
+    },
+    "game.ui.browse",
+  );
+
+  tool(
+    "overdare_observe",
+    "Read character, UI, and live instance state in one game-thread observation. Ask for at least one section. Use this rather than a screenshot for values — colours, text, positions, visibility — and a screenshot for how they actually look.",
+    {
+      character: z.boolean().optional().describe("Include the character's pose, velocity, facing, and standingOn."),
+      ui: z
+        .union([z.boolean(), z.object({ paths: z.array(z.string()).optional(), fields: z.array(z.string()).optional() })])
+        .optional()
+        .describe("true for everything, or the same narrowing overdare_ui_browse takes."),
+      instances: z
+        .union([
+          z.boolean(),
+          z.array(z.string()).min(1).max(64).describe("Names or dotted paths, read independently."),
+          z.record(z.any()).describe("{ targets } to name them, or { namePattern, class, under, maxDepth } to search."),
+        ])
+        .optional()
+        .describe("Live instance state as scripts have left it, not as it was saved."),
+      fields: z.array(z.string()).optional().describe("Per-instance fields to keep."),
+    },
+    "game.observe",
+  );
+
+  server.registerTool(
+    "overdare_input_inject",
+    {
+      description:
+        'Drive the playtest with an ordered batch of key, pointer, look, scroll, and wait events — up to 64 events over 60 seconds. A pointerButton takes either a `target` (UI name, path, or visible label, resolved against the live layout) or a normalized `position`, never both. Real input in the viewport cancels the batch. Confirm the effect with overdare_observe; the call itself only reports that the events were delivered. Note that only part of the viewport can take a pointer event when the Studio window hangs off screen — overdare_ui_browse reports the reachable region.',
+      inputSchema: {
+        events: z
+          .array(z.record(z.any()))
+          .min(1)
+          .max(64)
+          .describe(
+            'Ordered events. {type:"key", key:<KeyCode>, action:"down"|"up"|"press", durationMs?}, ' +
+              '{type:"pointerMove", position?:{x,y}, target?}, ' +
+              '{type:"pointerButton", button, action, target?|position?}, ' +
+              '{type:"look", yawDegrees?, pitchDegrees?, timeoutMs?}, ' +
+              '{type:"mouseDelta", delta:{x,y}}, {type:"scroll", delta}, ' +
+              '{type:"wait", durationMs, until?}.',
+          ),
+        pieSessionId: z.string().optional().describe("Defaults to the running session."),
+        clientId: z.string().optional().describe("Defaults to the first injectable client."),
+      },
+    },
+    async (a: Json) => {
+      try {
+        // Both ids are mandatory on the wire, even though they read as optional
+        // everywhere else — omitting either fails the whole batch with the same
+        // "Invalid input event" as a malformed event, so fill them in here.
+        let { pieSessionId, clientId } = a as { pieSessionId?: string; clientId?: string };
+        if (!pieSessionId || !clientId) {
+          const st = (await client.call("game.pie.status", {})) as {
+            running?: boolean;
+            pieSessionId?: string;
+            clients?: { clientId: string; injectable?: boolean }[];
+          };
+          if (!st?.running) return errOut("No playtest is running — start one with overdare_play.");
+          const target = (st.clients ?? []).find((c) => c.injectable) ?? st.clients?.[0];
+          if (!target) return errOut("The playtest has no client that can take input yet — wait and retry.");
+          pieSessionId ??= st.pieSessionId;
+          clientId ??= target.clientId;
+        }
+
+        // "press" is documented but this build rejects it; down/up is the only
+        // shape it accepts. Expand so callers can still write the short form.
+        const events: Json[] = [];
+        for (const ev of a.events as Json[]) {
+          if (ev.type === "key" && ev.action === "press") {
+            const { action, durationMs, ...rest } = ev;
+            events.push({ ...rest, action: "down" });
+            if (typeof durationMs === "number" && durationMs > 0)
+              events.push({ type: "wait", durationMs });
+            events.push({ ...rest, action: "up" });
+          } else {
+            events.push(ev);
+          }
+        }
+        if (events.length > 64)
+          return errOut(`Expanding "press" events exceeded the 64-event limit (${events.length}). Split the batch.`);
+
+        return ok(await client.call("game.input.inject", { events, pieSessionId, clientId }));
       } catch (err) {
         return fail(err);
       }

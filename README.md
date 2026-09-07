@@ -115,9 +115,40 @@ is Unreal Remote Control on 30010.
 | Tool | Via | Purpose |
 | --- | --- | --- |
 | `overdare_play` / `overdare_stop` | RPC `game.play` / `game.stop` | Start / stop a playtest |
-| `overdare_screenshot` | RPC `game.screenshot` | Capture the viewport and return the image. UI is included |
+| `overdare_screenshot` | RPC `game.screenshot` | Capture the viewport and return the image. UI is included; `locate` projects instances into click coordinates |
 | `overdare_camera` | RC | Aim the editor camera before a screenshot |
 | `overdare_viewport` | RC | Read or change how the editor viewport renders |
+
+### Runtime observation
+
+Only meaningful while a playtest is running. A screenshot shows pixels and the
+saved project shows what was authored; neither shows what the running game
+currently holds, which is where UI bugs live — a label a script rewrote, a frame
+a layout pushed off screen, a button buried under a higher `ZIndex`.
+
+| Tool | Via | Purpose |
+| --- | --- | --- |
+| `overdare_pie_status` | RPC `game.pie.status` | Is a playtest running, and which clients take input |
+| `overdare_ui_browse` | RPC `game.ui.browse` | The live UI as flat elements: path, class, text, normalized rect, visibility |
+| `overdare_observe` | RPC `game.observe` | Character, UI, and live instance state in one game-thread read |
+| `overdare_character_read` | RPC `game.character.read` | CFrame, speed, facing, what it stands on |
+| `overdare_input_inject` | RPC `game.input.inject` | Keys, pointer, look, scroll, waits — up to 64 events |
+
+Two things the underlying method does not tell you, which the tool handles:
+
+- `pieSessionId` and `clientId` are **mandatory** on the wire. Omitting either
+  fails the batch with the same `Invalid input event` as a malformed event, so
+  `overdare_input_inject` resolves both from `game.pie.status` when you leave
+  them out.
+- `action: "press"` is documented but **rejected** by this build; only
+  `down`/`up` are accepted. The tool expands `press` into a `down`/`wait`/`up`
+  triple so the short form still works.
+
+Pointer events only land on the part of the viewport that lies inside the Studio
+window. When the window hangs off screen the reachable region shrinks — sometimes
+to a sliver — and `overdare_ui_browse` reports it under `viewport.reachable`.
+The game still renders the whole frame, so a screenshot looks fine while a click
+at those coordinates goes nowhere.
 
 ### Assets
 
