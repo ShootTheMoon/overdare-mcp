@@ -97,9 +97,33 @@ is Unreal Remote Control on 30010.
 | `overdare_move_instance` | File | Reparent |
 | `overdare_duplicate_instance` | File | Copy a subtree with fresh GUIDs |
 | `overdare_delete_instance` | File | Delete by GUID |
+| `overdare_instance_create` | RPC `instance.create` | Create live, under one parent, no reload |
+| `overdare_instance_update` | RPC `instance.update` | Change properties live, no reload |
 | `overdare_instance_delete` | RPC `instance.delete` | Delete live, without a reload |
 | `overdare_script_add` | File | Create a Script / LocalScript / ModuleScript |
 | `overdare_script_edit` | File | Replace a script's source, or toggle `Enabled` |
+
+Prefer the RPC three when you are iterating: the file-backed tools rewrite the
+project and ask Studio to reload, so they need the playtest stopped, while these
+go to the running editor. Two things about them are worth knowing before you
+trust a result:
+
+- **Properties go flat.** Nesting them under a `Properties` key does not fail —
+  the call succeeds, `message` says `Properties is not a valid property of
+  Frame`, and every value is dropped. Same for a misspelled property name: a
+  `[WARNING]` in `message`, not an error. Read `message`.
+- **A class this build lacks is not an error either.** The call succeeds and
+  returns fewer GUIDs than you asked for. `overdare_instance_create` pairs them
+  back up and reports `guid: null` per instance. `UICorner`, `UIGradient`,
+  `UIPadding`, `UISizeConstraint`, `UITextSizeConstraint`, `ViewportFrame`,
+  `TextBox`, `CanvasGroup` and `VideoFrame` are all absent; `UIStroke`,
+  `UIListLayout`, `UIGridLayout`, `UIAspectRatioConstraint`, `ProgressBar` and
+  `ScrollingFrame` are present.
+
+Composite property values are tagged objects, and `UDim2` spells its second axis
+with a lower-case `y` — an upper-case `Y` is silently dropped. Rather than write
+those by hand, pass the array short forms (`Size: [0.5, 10, 0, 64]`,
+`BackgroundColor3: [20, 180, 90]`, `AnchorPoint: [0.5, 1]`); see `src/props.ts`.
 
 ### Project lifecycle
 

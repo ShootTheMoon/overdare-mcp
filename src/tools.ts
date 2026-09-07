@@ -30,6 +30,7 @@ import { promisify } from "node:util";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { z } from "zod";
+import { flatten, ABSENT_CLASSES } from "./props.js";
 
 const execFileP = promisify(execFile);
 
@@ -236,6 +237,89 @@ export function registerTools(server: McpServer, client: StudioRpcClient) {
     // The method takes a flat ActorGuids array. An items/targetGuid envelope is
     // rejected outright with "Invalid request format: ActorGuids is required".
     (a) => ({ ActorGuids: a.guids }),
+  );
+
+  // Live create/update, as opposed to the .ovdrjm tools further down: these go
+  // straight to the running editor, so they need no reload and no stopped
+  // playtest. Build one level at a time — the GUIDs that come back are the
+  // parents for the next call.
+  const PROPS_DESC =
+    "Properties, written flat. Composite values accept an array short form: " +
+    "Position/Size [xScale,xOffset,yScale,yOffset], *Color3 [r,g,b] 0-255, " +
+    "AnchorPoint [x,y], *CornerRadius/Padding [scale,offset], " +
+    "SliceCenter [minX,minY,maxX,maxY], FontFace {Family,Style,Weight}. " +
+    "Fully tagged ObjectType objects pass through as given.";
+
+  server.registerTool(
+    "overdare_instance_create",
+    {
+      description:
+        "Create instances under one parent in the live editor. Create one level at a time and use the returned GUIDs as the next level's parent. Classes this build does not have are not an error — they simply come back with a null guid, so check the result rather than assuming success.",
+      inputSchema: {
+        parentGuid: z.string().describe("Parent instance GUID (from overdare_browse or overdare_find)."),
+        instances: z
+          .array(
+            z.object({
+              class: z.string().describe('InstanceType, e.g. "Frame", "TextLabel", "ProgressBar", "UIStroke".'),
+              name: z.string(),
+              props: z.record(z.any()).optional().describe(PROPS_DESC),
+            }),
+          )
+          .min(1)
+          .max(100),
+      },
+    },
+    async (a: Json) => {
+      try {
+        const wanted = a.instances as { class: string; name: string; props?: Json }[];
+        const res = (await client.call("instance.create", {
+          ParentActorGuid: a.parentGuid,
+          Instances: wanted.map((i) => ({ InstanceType: i.class, Name: i.name, ...flatten(i.props) })),
+        })) as { ActorGuids?: string[]; [k: string]: unknown };
+
+        const guids = res?.ActorGuids ?? [];
+        const created = wanted.map((i, n) => ({ class: i.class, name: i.name, guid: guids[n] ?? null }));
+        const missed = created.filter((c) => !c.guid).map((c) => c.class);
+        return ok({
+          ...res,
+          created,
+          ...(missed.length
+            ? {
+                WARNING:
+                  `Not created: ${missed.join(", ")}. This build does not register these classes. ` +
+                  `Known absent: ${ABSENT_CLASSES.join(", ")}.`,
+              }
+            : {}),
+        });
+      } catch (err) {
+        return fail(err);
+      }
+    },
+  );
+
+  tool(
+    "overdare_instance_update",
+    "Change properties on existing instances in the live editor. Read the returned `message`: an unknown property name does not fail the call, it comes back as a [WARNING] there while everything else is applied.",
+    {
+      instances: z
+        .array(
+          z.object({
+            guid: z.string(),
+            name: z.string().optional().describe("Only when renaming."),
+            props: z.record(z.any()).optional().describe(PROPS_DESC),
+          }),
+        )
+        .min(1)
+        .max(100),
+    },
+    "instance.update",
+    (a) => ({
+      Instances: (a.instances as { guid: string; name?: string; props?: Json }[]).map((i) => ({
+        ActorGuid: i.guid,
+        ...(i.name ? { Name: i.name } : {}),
+        ...flatten(i.props),
+      })),
+    }),
   );
 
   // ---- Project / lifecycle ----------------------------------------------
