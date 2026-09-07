@@ -222,7 +222,9 @@ export function registerTools(server: McpServer, client: StudioRpcClient) {
         .describe("GUIDs to delete (from overdare_browse)."),
     },
     "instance.delete",
-    (a) => ({ items: (a.guids as string[]).map((targetGuid) => ({ targetGuid })) }),
+    // The method takes a flat ActorGuids array. An items/targetGuid envelope is
+    // rejected outright with "Invalid request format: ActorGuids is required".
+    (a) => ({ ActorGuids: a.guids }),
   );
 
   // ---- Project / lifecycle ----------------------------------------------
