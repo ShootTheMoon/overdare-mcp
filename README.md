@@ -29,6 +29,8 @@ underneath rather than the OVERDARE DataModel.
 ## Setup
 
 ```bash
+git clone https://github.com/ShootTheMoon/overdare-mcp
+cd overdare-mcp
 npm install
 npm run build
 ```
@@ -269,3 +271,16 @@ absent. To check whether a method exists, call it with empty params and read the
 error: `-32601` means no such method, anything else means it is there.
 `npm run probe -- <method> '<json>'` does this, and `overdare_rpc` is the
 fallback for a method with no dedicated tool.
+
+## Mesh pipeline scripts
+
+`scripts/` holds the Blender and Node helpers used to move large maps into Studio.
+OVERDARE caps a FBX at 30k triangles and 200 meshes, so big assets are split first.
+
+| Script | Purpose |
+|---|---|
+| `split_absolute.py` | Cut one asset into <=30k-tri pieces with world coordinates baked into the vertices, so every piece places at the same origin |
+| `split_all_absolute.sh` | Run `split_absolute.py` once per asset, one Blender process each |
+| `merge_detail.py` | Merge thin ornamental faces (friezes, glyphs) into one mesh so decimation can't leave floating slabs |
+| `place_asset_abs.mjs` | Build placement items for a split asset from `UGCLocalAssetTable.json` |
+| `split_asset.py` · `place_split_asset.mjs` | Earlier recentred-split workflow (per-piece offsets) |
